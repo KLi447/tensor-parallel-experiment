@@ -76,3 +76,22 @@ class Attention(nn.Module):
         
         output = output.transpose(1, 2).contiguous().view(batch, seq_len, -1)
         return self.wo_(output), present_key_value
+
+    @property
+    def linear_dict(self) -> Dict[str, Linear]:
+        return {
+            f"layers.{self.layer_id_}.self_attn.q_proj": self.wq_,
+            f"layers.{self.layer_id_}.self_attn.k_proj": self.wk_,
+            f"layers.{self.layer_id_}.self_attn.v_proj": self.wv_,
+            f"layers.{self.layer_id_}.self_attn.o_proj": self.wo_,
+        }
+
+    def load_adapter(self, adapter_model: AdapterModel):
+        for name, module in self.linear_dict.items():
+            if name not in adapter_model:
+                continue
+            module.load_adapter(adapter_model[name])
+
+    def offload_adapter(self, adapter_name: str):
+        for _, module in self.linear_dict.items():
+            module.offload_adapter(adapter_name)
