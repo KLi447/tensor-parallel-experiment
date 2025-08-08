@@ -2,6 +2,8 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from .linear import ColumnParallelLinear, RowParallelLinear
+from .lora import LoraAdapter
+from typing import Dict
 
 class MLP(nn.Module):
     def __init__(self, config, layer_id: int, rank: int, world_size: int):
@@ -18,19 +20,19 @@ class MLP(nn.Module):
         return self.down_(mlp_output)
 
     @property
-    def linear_dict(self) -> Dict[str, Linear]:
+    def linear_dict(self) -> Dict[str, nn.Module]:
         return {
             f"layers.{self.layer_id_}.mlp.gate_proj": self.gate_,
             f"layers.{self.layer_id_}.mlp.down_proj": self.down_,
             f"layers.{self.layer_id_}.mlp.up_proj": self.up_,
         }
 
-    def load_adapter(self, adapter_model: AdapterModel):
-        for name, module in self.linear_dict.items():
-            if name not in adapter_model:
-                continue
-            module.load_adapter(adapter_model[name])
+    def load_adapter(self, adapter_name: str, r: int, lora_alpha: int, lora_dropout: float):
+        self.gate_.load_adapter(adapter_name, r, lora_alpha, lora_dropout)
+        self.up_.load_adapter(adapter_name, r, lora_alpha, lora_dropout)
+        self.down_.load_adapter(adapter_name, r, lora_alpha, lora_dropout)
 
-    def offload_adapter(self, adapter_name: str):
-        for _, module in self.linear_dict.items():
-            module.offload_adapter(adapter_name)
+    def unload_adapter(self, adapter_name: str):
+        self.gate_.unload_adapter(adapter_name)
+        self.up_.unload_adapter(adapter_name)
+        self.down_.unload_adapter(adapter_name)

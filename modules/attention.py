@@ -2,7 +2,8 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from .linear import ColumnParallelLinear, RowParallelLinear
-from typing import Tuple, Optional
+from .lora import LoraAdapter
+from typing import Tuple, Optional, Dict
 
 def precompute_rope_angle(dim: int, seq_len: int, theta: float) -> Tuple[torch.Tensor, torch.Tensor]:
     angles = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
@@ -78,7 +79,7 @@ class Attention(nn.Module):
         return self.wo_(output), present_key_value
 
     @property
-    def linear_dict(self) -> Dict[str, Linear]:
+    def linear_dict(self) -> Dict[str, nn.Module]:
         return {
             f"layers.{self.layer_id_}.self_attn.q_proj": self.wq_,
             f"layers.{self.layer_id_}.self_attn.k_proj": self.wk_,
@@ -86,12 +87,14 @@ class Attention(nn.Module):
             f"layers.{self.layer_id_}.self_attn.o_proj": self.wo_,
         }
 
-    def load_adapter(self, adapter_model: AdapterModel):
-        for name, module in self.linear_dict.items():
-            if name not in adapter_model:
-                continue
-            module.load_adapter(adapter_model[name])
+    def load_adapter(self, adapter_name: str, r: int, lora_alpha: int, lora_dropout: float):
+        self.wq_.load_adapter(adapter_name, r, lora_alpha, lora_dropout)
+        self.wk_.load_adapter(adapter_name, r, lora_alpha, lora_dropout)
+        self.wv_.load_adapter(adapter_name, r, lora_alpha, lora_dropout)
+        self.wo_.load_adapter(adapter_name, r, lora_alpha, lora_dropout)
 
-    def offload_adapter(self, adapter_name: str):
-        for _, module in self.linear_dict.items():
-            module.offload_adapter(adapter_name)
+    def unload_adapter(self, adapter_name: str):
+        self.wq_.unload_adapter(adapter_name)
+        self.wk_.unload_adapter(adapter_name)
+        self.wv_.unload_adapter(adapter_name)
+        self.wo_.unload_adapter(adapter_name)
