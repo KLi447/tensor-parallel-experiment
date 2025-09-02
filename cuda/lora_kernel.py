@@ -146,7 +146,7 @@ def _batched_lora_backward_kernel_heterogeneous(
 
 class BatchedLoRAFunctionHeterogeneous(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, lora_a_flat, lora_b_flat, metadata, adapter_indices):
+    def forward(ctx, x, lora_a_flat, lora_b_flat, metadata, adapter_indices, block_size):
         x = x.contiguous()
         batch_size, in_features = x.shape
         out_features = in_features #FIXME eventually?
@@ -164,13 +164,14 @@ class BatchedLoRAFunctionHeterogeneous(torch.autograd.Function):
             stride_x_batch=x.stride(0), stride_x_in=x.stride(1),
             stride_out_batch=output.stride(0), stride_out_d=output.stride(1),
             stride_meta_adapter=metadata.stride(0), stride_meta_field=metadata.stride(1),
-            BLOCK_SIZE_K=32, BLOCK_SIZE_N=32, MAX_RANK_BLOCK=MAX_RANK_BLOCK,
+            BLOCK_SIZE_K=block_size, BLOCK_SIZE_N=block_size, MAX_RANK_BLOCK=MAX_RANK_BLOCK,
         )
         
         ctx.save_for_backward(x, lora_a_flat, lora_b_flat, metadata, adapter_indices)
         ctx.in_features = in_features
         ctx.out_features = out_features
         ctx.max_rank_block = MAX_RANK_BLOCK
+        ctx.block_size = block_size
         
         return output
 
@@ -178,6 +179,7 @@ class BatchedLoRAFunctionHeterogeneous(torch.autograd.Function):
     def backward(ctx, grad_output):
         grad_output = grad_output.contiguous()
         x, lora_a_flat, lora_b_flat, metadata, adapter_indices = ctx.saved_tensors
+        block_size = ctx.block_size
         
         grad_x = torch.empty_like(x)
         grad_lora_a_flat = torch.zeros_like(lora_a_flat)
@@ -194,10 +196,10 @@ class BatchedLoRAFunctionHeterogeneous(torch.autograd.Function):
             stride_grad_out_batch=grad_output.stride(0), stride_grad_out_d=grad_output.stride(1),
             stride_grad_x_batch=grad_x.stride(0), stride_grad_x_in=grad_x.stride(1),
             stride_meta_adapter=metadata.stride(0), stride_meta_field=metadata.stride(1),
-            BLOCK_SIZE_K=32, BLOCK_SIZE_N=32, MAX_RANK_BLOCK=ctx.max_rank_block,
+            BLOCK_SIZE_K=block_size, BLOCK_SIZE_N=block_size, MAX_RANK_BLOCK=ctx.max_rank_block,
         )
         
-        return grad_x, grad_lora_a_flat, grad_lora_b_flat, None, None
+        return grad_x, grad_lora_a_flat, grad_lora_b_flat, None, None, None
 
 batched_lora_heterogeneous = BatchedLoRAFunctionHeterogeneous.apply
 

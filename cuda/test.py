@@ -33,7 +33,11 @@ if __name__ == '__main__':
 
     lora_a_flat.requires_grad_()
     lora_b_flat.requires_grad_()
-    output_triton = batched_lora_heterogeneous(x, lora_a_flat, lora_b_flat, metadata, adapter_indices)
+
+    # FIXME
+    block_size=32
+
+    output_triton = batched_lora_heterogeneous(x, lora_a_flat, lora_b_flat, metadata, adapter_indices, block_size)
     output_triton.sum().backward()
 
     output_ref = reference_lora_forward(x_ref, lora_a_ref, lora_b_ref, adapter_indices)
@@ -47,34 +51,37 @@ if __name__ == '__main__':
     print(f"Gradient 'a' is close:   {torch.allclose(grad_lora_a_ref_flat, lora_a_flat.grad, atol=1e-2, rtol=1e-2)}")
     print(f"Gradient 'b' is close:   {torch.allclose(grad_lora_b_ref_flat, lora_b_flat.grad, atol=1e-2, rtol=1e-2)}")
 
-    print("\n--- Benchmarking Forward Pass ---")
-    quantiles = [0.25, 0.5, 0.75]
+    CANDIDATE_BLOCK_SIZES = [4, 8, 16, 32, 64, 128, 256]
 
-    x_fwd = x.detach()
-    lora_a_flat_fwd = lora_a_flat.detach()
-    lora_b_flat_fwd = lora_b_flat.detach()
-    lora_a_ref_fwd = [a.detach() for a in lora_a_ref]
-    lora_b_ref_fwd = [b.detach() for b in lora_b_ref]
+    for bs in CANDIDATE_BLOCK_SIZES:
+        print(f"\n--- Benchmarking Forward Pass, block_size={bs} ---")
+        quantiles = [0.25, 0.5, 0.75]
 
-    ref_fwd_latency = triton.testing.do_bench(lambda: reference_lora_forward(x_fwd, lora_a_ref_fwd, lora_b_ref_fwd, adapter_indices), quantiles=quantiles)
-    triton_fwd_latency = triton.testing.do_bench(lambda: batched_lora_heterogeneous(x_fwd, lora_a_flat_fwd, lora_b_flat_fwd, metadata, adapter_indices), quantiles=quantiles)
-    
-    speedup_fwd = ref_fwd_latency[1] / triton_fwd_latency[1]
-    print(f"Reference Forward (Median Latency): {ref_fwd_latency[1]:.4f} ms")
-    print(f"Triton Forward (Median Latency):    {triton_fwd_latency[1]:.4f} ms")
-    print(f"Forward Speedup: {speedup_fwd:.2f}x")
+        x_fwd = x.detach()
+        lora_a_flat_fwd = lora_a_flat.detach()
+        lora_b_flat_fwd = lora_b_flat.detach()
+        lora_a_ref_fwd = [a.detach() for a in lora_a_ref]
+        lora_b_ref_fwd = [b.detach() for b in lora_b_ref]
 
-    print("\n--- Benchmarking Backward Pass ---")
-    output_triton_bench = batched_lora_heterogeneous(x, lora_a_flat, lora_b_flat, metadata, adapter_indices)
-    loss_triton_bench = output_triton_bench.sum()
+        ref_fwd_latency = triton.testing.do_bench(lambda: reference_lora_forward(x_fwd, lora_a_ref_fwd, lora_b_ref_fwd, adapter_indices), quantiles=quantiles)
+        triton_fwd_latency = triton.testing.do_bench(lambda: batched_lora_heterogeneous(x_fwd, lora_a_flat_fwd, lora_b_flat_fwd, metadata, adapter_indices, bs), quantiles=quantiles)
+        
+        speedup_fwd = ref_fwd_latency[1] / triton_fwd_latency[1]
+        print(f"Reference Forward (Median Latency): {ref_fwd_latency[1]:.4f} ms")
+        print(f"Triton Forward (Median Latency):    {triton_fwd_latency[1]:.4f} ms")
+        print(f"Forward Speedup: {speedup_fwd:.2f}x")
 
-    output_ref_bench = reference_lora_forward(x_ref, lora_a_ref, lora_b_ref, adapter_indices)
-    loss_ref_bench = output_ref_bench.sum()
+        print("\n--- Benchmarking Backward Pass ---")
+        output_triton_bench = batched_lora_heterogeneous(x, lora_a_flat, lora_b_flat, metadata, adapter_indices, bs)
+        loss_triton_bench = output_triton_bench.sum()
 
-    ref_bwd_latency = triton.testing.do_bench(lambda: loss_ref_bench.backward(retain_graph=True), quantiles=quantiles)
-    triton_bwd_latency = triton.testing.do_bench(lambda: loss_triton_bench.backward(retain_graph=True), quantiles=quantiles)
+        output_ref_bench = reference_lora_forward(x_ref, lora_a_ref, lora_b_ref, adapter_indices)
+        loss_ref_bench = output_ref_bench.sum()
 
-    speedup_bwd = ref_bwd_latency[1] / triton_bwd_latency[1]
-    print(f"Reference Backward (Median Latency): {ref_bwd_latency[1]:.4f} ms")
-    print(f"Triton Backward (Median Latency):    {triton_bwd_latency[1]:.4f} ms")
-    print(f"Backward Speedup: {speedup_bwd:.2f}x")
+        ref_bwd_latency = triton.testing.do_bench(lambda: loss_ref_bench.backward(retain_graph=True), quantiles=quantiles)
+        triton_bwd_latency = triton.testing.do_bench(lambda: loss_triton_bench.backward(retain_graph=True), quantiles=quantiles)
+
+        speedup_bwd = ref_bwd_latency[1] / triton_bwd_latency[1]
+        print(f"Reference Backward (Median Latency): {ref_bwd_latency[1]:.4f} ms")
+        print(f"Triton Backward (Median Latency):    {triton_bwd_latency[1]:.4f} ms")
+        print(f"Backward Speedup: {speedup_bwd:.2f}x")
