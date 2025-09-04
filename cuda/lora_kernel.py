@@ -2,6 +2,17 @@ import torch
 import triton
 import triton.language as tl
 
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_N': 64, 'R_TILE': 32}, num_warps=4),
+        triton.Config({'BLOCK_SIZE_K': 64, 'BLOCK_SIZE_N': 64, 'R_TILE': 32}, num_warps=4),
+        triton.Config({'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_N': 128, 'R_TILE': 32}, num_warps=4),
+        triton.Config({'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_N': 64, 'R_TILE': 64}, num_warps=4),
+        triton.Config({'BLOCK_SIZE_K': 64, 'BLOCK_SIZE_N': 128, 'R_TILE': 64}, num_warps=8),
+        triton.Config({'BLOCK_SIZE_K': 128, 'BLOCK_SIZE_N': 128, 'R_TILE': 128}, num_warps=8),
+    ],
+    key=['in_features', 'out_features'],
+)
 @triton.jit
 def _batched_lora_forward(
     X_ptr,
@@ -194,7 +205,6 @@ def _batched_lora_backwardB(
     tl.store(grad_x_tok_ptr + k_offsets * stride_grad_x_in, grad_x_local, mask=k_mask)
 
 class BatchedLoRAFunctionHeterogeneous(torch.autograd.Function):
-    BLOCK_SIZE_N = 64
     @staticmethod
     def forward(ctx, x, lora_a_flat, lora_b_flat, metadata, adapter_indices, block_size):
         x = x.contiguous()
@@ -208,12 +218,11 @@ class BatchedLoRAFunctionHeterogeneous(torch.autograd.Function):
             T, D = x_tok.shape
 
         in_features = D
-        out_features = in_features  # FIXME?
+        out_features = in_features
 
         output_tok = torch.empty((T, out_features), device=x.device, dtype=x.dtype)
-
-        N_TILES = triton.cdiv(out_features, BatchedLoRAFunctionHeterogeneous.BLOCK_SIZE_N)
-        grid = (T, N_TILES)
+        
+        grid = lambda meta: (T, triton.cdiv(out_features, meta['BLOCK_SIZE_N']))
 
         _batched_lora_forward[grid](
             X_ptr=x_tok, 
@@ -230,11 +239,13 @@ class BatchedLoRAFunctionHeterogeneous(torch.autograd.Function):
             stride_out_d=output_tok.stride(1),
             stride_meta_adapter=metadata.stride(0),
             stride_meta_field=metadata.stride(1),
-            BLOCK_SIZE_K=32,
-            BLOCK_SIZE_N=BatchedLoRAFunctionHeterogeneous.BLOCK_SIZE_N,
-            R_TILE=32,
         )
 
+        best_config = _batched_lora_forward.best_config
+        ctx.BLOCK_SIZE_K = best_config.kwargs['BLOCK_SIZE_K']
+        ctx.BLOCK_SIZE_N = best_config.kwargs['BLOCK_SIZE_N']
+        ctx.R_TILE = best_config.kwargs['R_TILE']
+        
         ctx.save_for_backward(x_tok, lora_a_flat, lora_b_flat, metadata, adapter_indices)
         ctx.in_features = in_features
         ctx.out_features = out_features
@@ -255,6 +266,10 @@ class BatchedLoRAFunctionHeterogeneous(torch.autograd.Function):
         out_features = ctx.out_features
         is_bsd = ctx.is_bsd
 
+        BLOCK_SIZE_K = ctx.BLOCK_SIZE_K
+        BLOCK_SIZE_N = ctx.BLOCK_SIZE_N
+        R_TILE = ctx.R_TILE
+
         grad_output = grad_output.contiguous()
         if is_bsd:
             B, S, _ = grad_output.shape
@@ -272,13 +287,8 @@ class BatchedLoRAFunctionHeterogeneous(torch.autograd.Function):
         grad_x_tok = torch.zeros((T, in_features), device=x_tok.device, dtype=x_tok.dtype)
         grad_lora_a_flat = torch.zeros_like(lora_a_flat)
         grad_lora_b_flat = torch.zeros_like(lora_b_flat)
-
-        BLOCK_SIZE_N = 64
-        BLOCK_SIZE_K = 64
-        R_TILE = 32
-
-        N_TILES = triton.cdiv(out_features, BLOCK_SIZE_N)
-        grid1 = (T, N_TILES)
+        
+        grid1 = (T, triton.cdiv(out_features, BLOCK_SIZE_N))
 
         _batched_lora_backwardA[grid1](
             x_tok, grad_out_tok,
@@ -290,11 +300,12 @@ class BatchedLoRAFunctionHeterogeneous(torch.autograd.Function):
             grad_out_tok.stride(0), grad_out_tok.stride(1),
             metadata.stride(0), metadata.stride(1),
             acc_h_scratch.stride(0), acc_h_scratch.stride(1),
-            BLOCK_SIZE_K=BLOCK_SIZE_K, BLOCK_SIZE_N=BLOCK_SIZE_N, R_TILE=R_TILE,
+            BLOCK_SIZE_K=BLOCK_SIZE_K, 
+            BLOCK_SIZE_N=BLOCK_SIZE_N, 
+            R_TILE=R_TILE,
         )
 
-        K_TILES = triton.cdiv(in_features, BLOCK_SIZE_K)
-        grid2 = (T, K_TILES)
+        grid2 = (T, triton.cdiv(in_features, BLOCK_SIZE_K))
 
         _batched_lora_backwardB[grid2](
             x_tok, acc_h_scratch,
@@ -305,11 +316,12 @@ class BatchedLoRAFunctionHeterogeneous(torch.autograd.Function):
             acc_h_scratch.stride(0), acc_h_scratch.stride(1),
             metadata.stride(0), metadata.stride(1),
             grad_x_tok.stride(0), grad_x_tok.stride(1),
-            BLOCK_SIZE_K=BLOCK_SIZE_K, R_TILE=R_TILE,
+            BLOCK_SIZE_K=BLOCK_SIZE_K, 
+            R_TILE=R_TILE,
         )
 
         if is_bsd:
-            grad_x = grad_x_tok.view(B, S, in_features)
+            grad_x = grad_x_tok.view(ctx.B, ctx.S, in_features)
         else:
             grad_x = grad_x_tok
 

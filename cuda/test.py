@@ -68,6 +68,8 @@ if __name__ == '__main__':
     print(f"Gradient 'x' is close:   {x_grad_close}")
     print(f"Gradient 'a' is close:   {a_grad_close}")
     print(f"Gradient 'b' is close:   {b_grad_close}")
+    print(grad_lora_a_ref_flat)
+    print(lora_a_flat.grad)
 
     CANDIDATE_BLOCK_SIZES = [4, 8, 16, 32, 64, 128]
 
