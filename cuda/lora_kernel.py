@@ -206,7 +206,7 @@ def _batched_lora_backwardB(
 
 class BatchedLoRAFunctionHeterogeneous(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, lora_a_flat, lora_b_flat, metadata, adapter_indices, block_size):
+    def forward(ctx, x, lora_a_flat, lora_b_flat, metadata, adapter_indices):
         x = x.contiguous()
         is_bsd = (x.ndim == 3)
         if is_bsd:

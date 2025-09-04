@@ -44,9 +44,7 @@ if __name__ == '__main__':
 
     print("Verifying Triton kernel against reference implementation...")
 
-    block_size = 32
-
-    output_triton = batched_lora_heterogeneous(x, lora_a_flat, lora_b_flat, metadata, adapter_indices, block_size)
+    output_triton = batched_lora_heterogeneous(x, lora_a_flat, lora_b_flat, metadata, adapter_indices)
     torch.cuda.synchronize()
     (output_triton.sum()).backward()
     torch.cuda.synchronize()
@@ -68,63 +66,59 @@ if __name__ == '__main__':
     print(f"Gradient 'x' is close:   {x_grad_close}")
     print(f"Gradient 'a' is close:   {a_grad_close}")
     print(f"Gradient 'b' is close:   {b_grad_close}")
-    print(grad_lora_a_ref_flat)
-    print(lora_a_flat.grad)
+    # print(grad_lora_a_ref_flat)
+    # print(lora_a_flat.grad)
 
-    CANDIDATE_BLOCK_SIZES = [4, 8, 16, 32, 64, 128]
+    quantiles = [0.25, 0.5, 0.75]
 
-    for bs in CANDIDATE_BLOCK_SIZES:
-        print(f"\n--- block_size={bs} ---")
-        quantiles = [0.25, 0.5, 0.75]
+    x_fwd = x.detach()
+    lora_a_flat_fwd = lora_a_flat.detach()
+    lora_b_flat_fwd = lora_b_flat.detach()
 
-        x_fwd = x.detach()
-        lora_a_flat_fwd = lora_a_flat.detach()
-        lora_b_flat_fwd = lora_b_flat.detach()
+    lora_a_ref_fwd = [a.detach() for a in lora_a_ref]
+    lora_b_ref_fwd = [b.detach() for b in lora_b_ref]
 
-        lora_a_ref_fwd = [a.detach() for a in lora_a_ref]
-        lora_b_ref_fwd = [b.detach() for b in lora_b_ref]
+    ref_fwd_latency = triton.testing.do_bench(
+        lambda: reference_lora_forward(x_fwd, lora_a_ref_fwd, lora_b_ref_fwd, adapter_indices),
+        quantiles=quantiles
+    )
+    triton_fwd_latency = triton.testing.do_bench(
+        lambda: batched_lora_heterogeneous(x_fwd, lora_a_flat_fwd, lora_b_flat_fwd, metadata, adapter_indices),
+        quantiles=quantiles
+    )
 
-        ref_fwd_latency = triton.testing.do_bench(
-            lambda: reference_lora_forward(x_fwd, lora_a_ref_fwd, lora_b_ref_fwd, adapter_indices),
-            quantiles=quantiles
-        )
-        triton_fwd_latency = triton.testing.do_bench(
-            lambda: batched_lora_heterogeneous(x_fwd, lora_a_flat_fwd, lora_b_flat_fwd, metadata, adapter_indices, bs),
-            quantiles=quantiles
-        )
+    median_ref_fwd = ref_fwd_latency[1]
+    median_triton_fwd = triton_fwd_latency[1]
+    speedup_fwd = median_ref_fwd / max(1e-12, median_triton_fwd)
+    print(f"\nReference Forward (Median Latency): {median_ref_fwd:.6f} s")
+    print(f"Triton Forward   (Median Latency): {median_triton_fwd:.6f} s")
+    print(f"Forward Speedup: {speedup_fwd:.2f}x")
 
-        median_ref_fwd = ref_fwd_latency[1]
-        median_triton_fwd = triton_fwd_latency[1]
-        speedup_fwd = median_ref_fwd / max(1e-12, median_triton_fwd)
-        print(f"Reference Forward (Median Latency): {median_ref_fwd:.6f} s")
-        print(f"Triton Forward   (Median Latency): {median_triton_fwd:.6f} s")
-        print(f"Forward Speedup: {speedup_fwd:.2f}x")
+    def triton_backward_once():
+        x_b = x.detach().requires_grad_()
+        a_b = lora_a_flat.detach().requires_grad_()
+        b_b = lora_b_flat.detach().requires_grad_()
+        out = batched_lora_heterogeneous(x_b, a_b, b_b, metadata, adapter_indices)
+        out.sum().backward(retain_graph=False)
+        torch.cuda.synchronize()
 
-        def triton_backward_once():
-            x_b = x.detach().requires_grad_()
-            a_b = lora_a_flat.detach().requires_grad_()
-            b_b = lora_b_flat.detach().requires_grad_()
-            out = batched_lora_heterogeneous(x_b, a_b, b_b, metadata, adapter_indices, bs)
-            out.sum().backward(retain_graph=False)
-            torch.cuda.synchronize()
+    def ref_backward_once():
+        x_b = x_ref.detach().requires_grad_()
+        a_list = [a.detach().requires_grad_() for a in lora_a_ref]
+        b_list = [b.detach().requires_grad_() for b in lora_b_ref]
+        out_ref = reference_lora_forward(x_b, a_list, b_list, adapter_indices)
+        out_ref.sum().backward(retain_graph=False)
+        torch.cuda.synchronize()
 
-        def ref_backward_once():
-            x_b = x_ref.detach().requires_grad_()
-            a_list = [a.detach().requires_grad_() for a in lora_a_ref]
-            b_list = [b.detach().requires_grad_() for b in lora_b_ref]
-            out_ref = reference_lora_forward(x_b, a_list, b_list, adapter_indices)
-            out_ref.sum().backward(retain_graph=False)
-            torch.cuda.synchronize()
+    ref_bwd_latency = triton.testing.do_bench(ref_backward_once, warmup=100, rep=1000, quantiles=quantiles)
+    triton_bwd_latency = triton.testing.do_bench(triton_backward_once, warmup=100, rep=1000, quantiles=quantiles)
 
-        ref_bwd_latency = triton.testing.do_bench(ref_backward_once, quantiles=quantiles)
-        triton_bwd_latency = triton.testing.do_bench(triton_backward_once, quantiles=quantiles)
+    median_ref_bwd = ref_bwd_latency[1]
+    median_triton_bwd = triton_bwd_latency[1]
+    speedup_bwd = median_ref_bwd / max(1e-12, median_triton_bwd)
 
-        median_ref_bwd = ref_bwd_latency[1]
-        median_triton_bwd = triton_bwd_latency[1]
-        speedup_bwd = median_ref_bwd / max(1e-12, median_triton_bwd)
-
-        print(f"Reference Backward (Median Latency): {median_ref_bwd:.6f} s")
-        print(f"Triton Backward   (Median Latency): {median_triton_bwd:.6f} s")
-        print(f"Backward Speedup: {speedup_bwd:.2f}x")
+    print(f"Reference Backward (Median Latency): {median_ref_bwd:.6f} s")
+    print(f"Triton Backward   (Median Latency): {median_triton_bwd:.6f} s")
+    print(f"Backward Speedup: {speedup_bwd:.2f}x")
 
     print("\nDone.")
