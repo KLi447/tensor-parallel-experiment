@@ -3,202 +3,260 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _batched_lora_forward_kernel_heterogeneous(
+def _batched_lora_forward(
     X_ptr,
     LORA_A_FLAT_ptr, LORA_B_FLAT_ptr,
     METADATA_ptr,
     ADAPTER_INDICES_ptr,
     OUTPUT_ptr,
     in_features, out_features,
-    stride_x_batch, stride_x_in,
-    stride_out_batch, stride_out_d,
+    stride_x_tok, stride_x_in,
+    stride_out_tok, stride_out_d,
     stride_meta_adapter, stride_meta_field,
     BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
-    MAX_RANK_BLOCK: tl.constexpr,
+    R_TILE: tl.constexpr,
 ):
-    batch_idx = tl.program_id(axis=0)
+    pid_tok = tl.program_id(axis=0)
+    pid_nt  = tl.program_id(axis=1)
 
-    adapter_idx = tl.load(ADAPTER_INDICES_ptr + batch_idx)
+    adapter_idx = tl.load(ADAPTER_INDICES_ptr + pid_tok)
 
     meta_base_ptr = METADATA_ptr + adapter_idx * stride_meta_adapter
     offset_a = tl.load(meta_base_ptr + 0 * stride_meta_field)
     offset_b = tl.load(meta_base_ptr + 1 * stride_meta_field)
     rank = tl.load(meta_base_ptr + 2 * stride_meta_field)
 
+    x_tok_ptr = X_ptr + pid_tok * stride_x_tok
+    out_tok_ptr = OUTPUT_ptr + pid_tok * stride_out_tok
     lora_a_i_ptr = LORA_A_FLAT_ptr + offset_a
     lora_b_i_ptr = LORA_B_FLAT_ptr + offset_b
-    x_i_ptr = X_ptr + batch_idx * stride_x_batch
 
-    acc_h = tl.zeros((MAX_RANK_BLOCK,), dtype=tl.float32)
+    n_offsets = pid_nt * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    n_mask = n_offsets < out_features
 
-    r_offsets = tl.arange(0, MAX_RANK_BLOCK)
-    for k_start in range(0, tl.cdiv(in_features, BLOCK_SIZE_K)):
-        k_offsets = (k_start * BLOCK_SIZE_K) + tl.arange(0, BLOCK_SIZE_K)
-        k_mask = k_offsets < in_features
+    acc_final = tl.zeros((BLOCK_SIZE_N,), dtype=tl.float32)
 
-        x_ptrs = x_i_ptr + k_offsets * stride_x_in
-        x_chunk = tl.load(x_ptrs, mask=k_mask, other=0.0)
+    r_base = 0
+    while r_base < rank:
+        r_offsets = r_base + tl.arange(0, R_TILE)
+        r_mask = r_offsets < rank
 
-        a_ptrs = lora_a_i_ptr + \
-                 (r_offsets[:, None] * in_features) + \
-                 (k_offsets[None, :])
-        a_mask = (r_offsets[:, None] < rank) & k_mask[None, :]
-        a_chunk = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        h_tile = tl.zeros((R_TILE,), dtype=tl.float32)
 
-        acc_h += tl.sum(x_chunk[None, :] * a_chunk, axis=1)
+        for k_start in range(0, tl.cdiv(in_features, BLOCK_SIZE_K)):
+            k_offsets = k_start * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
+            k_mask = k_offsets < in_features
 
-    for n_start in range(0, tl.cdiv(out_features, BLOCK_SIZE_N)):
-        n_offsets = (n_start * BLOCK_SIZE_N) + tl.arange(0, BLOCK_SIZE_N)
-        n_mask = n_offsets < out_features
+            x_chunk = tl.load(x_tok_ptr + k_offsets * stride_x_in, mask=k_mask, other=0.0)
 
-        acc_final = tl.zeros((BLOCK_SIZE_N,), dtype=tl.float32)
+            a_ptrs = lora_a_i_ptr + (r_offsets[:, None] * in_features) + k_offsets[None, :]
+            a_mask = r_mask[:, None] & k_mask[None, :]
+            a_chunk = tl.load(a_ptrs, mask=a_mask, other=0.0)
 
-        b_ptrs = lora_b_i_ptr + \
-                 (n_offsets[:, None] * rank) + \
-                 (r_offsets[None, :])
-        b_mask = n_mask[:, None] & (r_offsets[None, :] < rank)
-        b_chunk = tl.load(b_ptrs, mask=b_mask, other=0.0)
+            h_tile += tl.sum(x_chunk[None, :] * a_chunk, axis=1)
 
-        acc_final += tl.sum(b_chunk * acc_h[None, :], axis=1)
-
-        output_ptrs = OUTPUT_ptr + batch_idx * stride_out_batch + n_offsets * stride_out_d
-        tl.store(output_ptrs, acc_final, mask=n_mask)
-
-@triton.jit
-def _batched_lora_backward_kernel_heterogeneous(
-    X_ptr, LORA_A_FLAT_ptr, LORA_B_FLAT_ptr, METADATA_ptr, ADAPTER_INDICES_ptr, GRAD_OUTPUT_ptr,
-    GRAD_X_ptr, GRAD_LORA_A_FLAT_ptr, GRAD_LORA_B_FLAT_ptr,
-    in_features, out_features,
-    stride_x_batch, stride_x_in,
-    stride_grad_out_batch, stride_grad_out_d,
-    stride_grad_x_batch, stride_grad_x_in,
-    stride_meta_adapter, stride_meta_field,
-    BLOCK_SIZE_K: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    MAX_RANK_BLOCK: tl.constexpr,
-):
-    batch_idx = tl.program_id(axis=0)
-
-    adapter_idx = tl.load(ADAPTER_INDICES_ptr + batch_idx)
-    meta_base_ptr = METADATA_ptr + adapter_idx * stride_meta_adapter
-    offset_a = tl.load(meta_base_ptr + 0 * stride_meta_field)
-    offset_b = tl.load(meta_base_ptr + 1 * stride_meta_field)
-    rank = tl.load(meta_base_ptr + 2 * stride_meta_field)
-
-    x_i_ptr = X_ptr + batch_idx * stride_x_batch
-    lora_a_i_ptr = LORA_A_FLAT_ptr + offset_a
-    lora_b_i_ptr = LORA_B_FLAT_ptr + offset_b
-    grad_out_i_ptr = GRAD_OUTPUT_ptr + batch_idx * stride_grad_out_batch
-    grad_x_i_ptr = GRAD_X_ptr + batch_idx * stride_grad_x_batch
-    grad_lora_a_i_ptr = GRAD_LORA_A_FLAT_ptr + offset_a
-    grad_lora_b_i_ptr = GRAD_LORA_B_FLAT_ptr + offset_b
-    
-    r_offsets = tl.arange(0, MAX_RANK_BLOCK)
-    r_mask = r_offsets < rank
-
-    acc_h = tl.zeros((MAX_RANK_BLOCK,), dtype=tl.float32)
-    for k_start in range(0, tl.cdiv(in_features, BLOCK_SIZE_K)):
-        k_offsets = k_start * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
-        k_mask = k_offsets < in_features
-        x_chunk = tl.load(x_i_ptr + k_offsets * stride_x_in, mask=k_mask, other=0.0)
-        a_ptrs = lora_a_i_ptr + (r_offsets[:, None] * in_features) + k_offsets[None, :]
-        a_mask = r_mask[:, None] & k_mask[None, :]
-        a_chunk = tl.load(a_ptrs, mask=a_mask, other=0.0)
-        acc_h += tl.sum(x_chunk[None, :] * a_chunk, axis=1)
-
-    acc_grad_h = tl.zeros((MAX_RANK_BLOCK,), dtype=tl.float32)
-    for n_start in range(0, tl.cdiv(out_features, BLOCK_SIZE_N)):
-        n_offsets = n_start * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-        n_mask = n_offsets < out_features
-        grad_out_chunk = tl.load(grad_out_i_ptr + n_offsets * stride_grad_out_d, mask=n_mask, other=0.0)
         b_ptrs = lora_b_i_ptr + (n_offsets[:, None] * rank) + r_offsets[None, :]
         b_mask = n_mask[:, None] & r_mask[None, :]
         b_chunk = tl.load(b_ptrs, mask=b_mask, other=0.0)
-        acc_grad_h += tl.sum(grad_out_chunk[:, None] * b_chunk, axis=0)
 
-    for k_start in range(0, tl.cdiv(in_features, BLOCK_SIZE_K)):
-        k_offsets = k_start * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
-        k_mask = k_offsets < in_features
-        a_ptrs = lora_a_i_ptr + (r_offsets[:, None] * in_features) + k_offsets[None, :]
-        a_mask = r_mask[:, None] & k_mask[None, :]
-        a_chunk = tl.load(a_ptrs, mask=a_mask, other=0.0)
-        grad_x_chunk = tl.sum(acc_grad_h[:, None] * a_chunk, axis=0)
-        tl.store(grad_x_i_ptr + k_offsets * stride_grad_x_in, grad_x_chunk, mask=k_mask)
+        acc_final += tl.sum(b_chunk * h_tile[None, :], axis=1)
 
-    for n_start in range(0, tl.cdiv(out_features, BLOCK_SIZE_N)):
-        n_offsets = n_start * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-        n_mask = n_offsets < out_features
-        grad_out_chunk = tl.load(grad_out_i_ptr + n_offsets * stride_grad_out_d, mask=n_mask, other=0.0)
-        grad_b_chunk = grad_out_chunk[:, None] * acc_h[None, :]
-        grad_b_ptrs = grad_lora_b_i_ptr + (n_offsets[:, None] * rank) + r_offsets[None, :]
-        grad_b_mask = n_mask[:, None] & r_mask[None, :]
-        tl.atomic_add(grad_b_ptrs, grad_b_chunk, mask=grad_b_mask)
+        r_base += R_TILE
 
-    for k_start in range(0, tl.cdiv(in_features, BLOCK_SIZE_K)):
-        k_offsets = k_start * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
-        k_mask = k_offsets < in_features
-        x_chunk = tl.load(x_i_ptr + k_offsets * stride_x_in, mask=k_mask, other=0.0)
-        grad_a_chunk = acc_grad_h[:, None] * x_chunk[None, :]
-        grad_a_ptrs = grad_lora_a_i_ptr + (r_offsets[:, None] * in_features) + k_offsets[None, :]
-        grad_a_mask = r_mask[:, None] & k_mask[None, :]
-        tl.atomic_add(grad_a_ptrs, grad_a_chunk, mask=grad_a_mask)
+    out_ptrs = out_tok_ptr + n_offsets * stride_out_d
+    tl.store(out_ptrs, acc_final, mask=n_mask)
+
+@triton.jit
+def _batched_lora_backward(
+    X_ptr, GRAD_OUT_ptr,
+    LORA_A_FLAT_ptr, LORA_B_FLAT_ptr,
+    METADATA_ptr, ADAPTER_INDICES_ptr,
+    GRAD_X_ptr, GRAD_LORA_A_FLAT_ptr, GRAD_LORA_B_FLAT_ptr,
+    in_features, out_features,
+    stride_x_tok, stride_x_in,
+    stride_grad_out_tok, stride_grad_out_d,
+    stride_grad_x_tok, stride_grad_x_in,
+    stride_meta_adapter, stride_meta_field,
+    BLOCK_SIZE_K: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    R_TILE: tl.constexpr,
+):
+    pid_tok = tl.program_id(0)
+    adapter_idx = tl.load(ADAPTER_INDICES_ptr + pid_tok)
+    meta_ptr = METADATA_ptr + adapter_idx * stride_meta_adapter
+    offset_a = tl.load(meta_ptr + 0 * stride_meta_field)
+    offset_b = tl.load(meta_ptr + 1 * stride_meta_field)
+    rank     = tl.load(meta_ptr + 2 * stride_meta_field)
+
+    x_tok_ptr      = X_ptr + pid_tok * stride_x_tok
+    grad_out_tok   = GRAD_OUT_ptr + pid_tok * stride_grad_out_tok
+    grad_x_tok_ptr = GRAD_X_ptr + pid_tok * stride_grad_x_tok
+
+    lora_a_ptr = LORA_A_FLAT_ptr + offset_a
+    lora_b_ptr = LORA_B_FLAT_ptr + offset_b
+    grad_a_ptr = GRAD_LORA_A_FLAT_ptr + offset_a
+    grad_b_ptr = GRAD_LORA_B_FLAT_ptr + offset_b
+
+    r_base = 0
+    while r_base < rank:
+        r_offsets = r_base + tl.arange(0, R_TILE)
+        r_mask = r_offsets < rank
+        h_tile = tl.zeros((R_TILE,), dtype=tl.float32)
+
+        for k_start in range(0, tl.cdiv(in_features, BLOCK_SIZE_K)):
+            k_offsets = k_start * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
+            k_mask = k_offsets < in_features
+            x_chunk = tl.load(x_tok_ptr + k_offsets * stride_x_in, mask=k_mask, other=0.0)
+
+            a_ptrs = lora_a_ptr + (r_offsets[:, None] * in_features) + k_offsets[None, :]
+            a_mask = r_mask[:, None] & k_mask[None, :]
+            a_chunk = tl.load(a_ptrs, mask=a_mask, other=0.0)
+
+            h_tile += tl.sum(a_chunk * x_chunk[None, :], axis=1)
+
+        acc_grad_h_tile = tl.zeros((R_TILE,), dtype=tl.float32)
+
+        for n_start in range(0, tl.cdiv(out_features, BLOCK_SIZE_N)):
+            n_offsets = n_start * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+            n_mask = n_offsets < out_features
+            grad_out_chunk = tl.load(grad_out_tok + n_offsets * stride_grad_out_d, mask=n_mask, other=0.0)
+
+            b_ptrs = lora_b_ptr + (n_offsets[:, None] * rank) + r_offsets[None, :]
+            b_mask = n_mask[:, None] & r_mask[None, :]
+            b_chunk = tl.load(b_ptrs, mask=b_mask, other=0.0)
+
+            acc_grad_h_tile += tl.sum(grad_out_chunk[:, None] * b_chunk, axis=0)
+
+            grad_b_chunk = grad_out_chunk[:, None] * h_tile[None, :]
+
+            grad_b_ptrs = grad_b_ptr + (n_offsets[:, None] * rank) + r_offsets[None, :]
+            grad_b_mask = n_mask[:, None] & r_mask[None, :]
+            tl.atomic_add(grad_b_ptrs, grad_b_chunk, mask=grad_b_mask)
+
+        for k_start in range(0, tl.cdiv(in_features, BLOCK_SIZE_K)):
+            k_offsets = k_start * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
+            k_mask = k_offsets < in_features
+            x_chunk = tl.load(x_tok_ptr + k_offsets * stride_x_in, mask=k_mask, other=0.0)
+
+            a_ptrs = lora_a_ptr + (r_offsets[:, None] * in_features) + k_offsets[None, :]
+            a_mask = r_mask[:, None] & k_mask[None, :]
+            a_chunk = tl.load(a_ptrs, mask=a_mask, other=0.0)
+
+            grad_x_chunk = tl.sum(acc_grad_h_tile[:, None] * a_chunk, axis=0)
+
+            grad_x_ptrs = grad_x_tok_ptr + k_offsets * stride_grad_x_in
+            tl.atomic_add(grad_x_ptrs, grad_x_chunk, mask=k_mask)
+
+            grad_a_chunk = acc_grad_h_tile[:, None] * x_chunk[None, :]
+
+            grad_a_ptrs = grad_a_ptr + (r_offsets[:, None] * in_features) + k_offsets[None, :]
+            grad_a_mask = r_mask[:, None] & k_mask[None, :]
+            tl.atomic_add(grad_a_ptrs, grad_a_chunk, mask=grad_a_mask)
+
+        r_base += R_TILE
 
 class BatchedLoRAFunctionHeterogeneous(torch.autograd.Function):
+    BLOCK_SIZE_N = 64
     @staticmethod
     def forward(ctx, x, lora_a_flat, lora_b_flat, metadata, adapter_indices, block_size):
         x = x.contiguous()
-        batch_size, in_features = x.shape
-        out_features = in_features #FIXME eventually?
-        
-        output = torch.empty((batch_size, out_features), device=x.device, dtype=x.dtype)
-        grid = (batch_size,)
-        
-        max_rank = int(torch.max(metadata[:, 2]).item())
-        MAX_RANK_BLOCK = triton.next_power_of_2(max_rank)
+        is_bsd = (x.ndim == 3)
+        if is_bsd:
+            B, S, D = x.shape
+            T = B * S
+            x_tok = x.view(T, D)
+        else:
+            x_tok = x
+            T, D = x_tok.shape
 
-        _batched_lora_forward_kernel_heterogeneous[grid](
-            X_ptr=x, LORA_A_FLAT_ptr=lora_a_flat, LORA_B_FLAT_ptr=lora_b_flat,
-            METADATA_ptr=metadata, ADAPTER_INDICES_ptr=adapter_indices, OUTPUT_ptr=output,
-            in_features=in_features, out_features=out_features,
-            stride_x_batch=x.stride(0), stride_x_in=x.stride(1),
-            stride_out_batch=output.stride(0), stride_out_d=output.stride(1),
-            stride_meta_adapter=metadata.stride(0), stride_meta_field=metadata.stride(1),
-            BLOCK_SIZE_K=block_size, BLOCK_SIZE_N=block_size, MAX_RANK_BLOCK=MAX_RANK_BLOCK,
+        in_features = D
+        out_features = in_features  # FIXME?
+
+        output_tok = torch.empty((T, out_features), device=x.device, dtype=x.dtype)
+
+        N_TILES = triton.cdiv(out_features, BatchedLoRAFunctionHeterogeneous.BLOCK_SIZE_N)
+        grid = (T, N_TILES)
+
+        _batched_lora_forward[grid](
+            X_ptr=x_tok, 
+            LORA_A_FLAT_ptr=lora_a_flat,
+            LORA_B_FLAT_ptr=lora_b_flat,
+            METADATA_ptr=metadata,
+            ADAPTER_INDICES_ptr=adapter_indices,
+            OUTPUT_ptr=output_tok,
+            in_features=in_features,
+            out_features=out_features,
+            stride_x_tok=x_tok.stride(0),
+            stride_x_in=x_tok.stride(1),
+            stride_out_tok=output_tok.stride(0),
+            stride_out_d=output_tok.stride(1),
+            stride_meta_adapter=metadata.stride(0),
+            stride_meta_field=metadata.stride(1),
+            BLOCK_SIZE_K=32,
+            BLOCK_SIZE_N=BatchedLoRAFunctionHeterogeneous.BLOCK_SIZE_N,
+            R_TILE=32,
         )
-        
-        ctx.save_for_backward(x, lora_a_flat, lora_b_flat, metadata, adapter_indices)
+
+        ctx.save_for_backward(x_tok, lora_a_flat, lora_b_flat, metadata, adapter_indices)
         ctx.in_features = in_features
         ctx.out_features = out_features
-        ctx.max_rank_block = MAX_RANK_BLOCK
-        ctx.block_size = block_size
-        
-        return output
+        ctx.is_bsd = is_bsd
+        if is_bsd:
+            ctx.B = B
+            ctx.S = S
+
+        if is_bsd:
+            return output_tok.view(B, S, out_features)
+        else:
+            return output_tok
 
     @staticmethod
     def backward(ctx, grad_output):
+        x_tok, lora_a_flat, lora_b_flat, metadata, adapter_indices = ctx.saved_tensors
+        in_features = ctx.in_features
+        out_features = ctx.out_features
+        is_bsd = ctx.is_bsd
+
+        # Make grad_output contiguous and flatten to tokens if needed
         grad_output = grad_output.contiguous()
-        x, lora_a_flat, lora_b_flat, metadata, adapter_indices = ctx.saved_tensors
-        block_size = ctx.block_size
-        
-        grad_x = torch.empty_like(x)
+        if is_bsd:
+            B, S, _ = grad_output.shape
+            T = B * S
+            grad_out_tok = grad_output.view(T, out_features)
+        else:
+            grad_out_tok = grad_output
+            T = grad_out_tok.shape[0]
+
+        # Allocate grads (token-major)
+        grad_x_tok = torch.zeros((T, in_features), device=x_tok.device, dtype=x_tok.dtype)
         grad_lora_a_flat = torch.zeros_like(lora_a_flat)
         grad_lora_b_flat = torch.zeros_like(lora_b_flat)
-        
-        grid = (x.shape[0],)
 
-        _batched_lora_backward_kernel_heterogeneous[grid](
-            X_ptr=x, LORA_A_FLAT_ptr=lora_a_flat, LORA_B_FLAT_ptr=lora_b_flat,
-            METADATA_ptr=metadata, ADAPTER_INDICES_ptr=adapter_indices, GRAD_OUTPUT_ptr=grad_output,
-            GRAD_X_ptr=grad_x, GRAD_LORA_A_FLAT_ptr=grad_lora_a_flat, GRAD_LORA_B_FLAT_ptr=grad_lora_b_flat,
-            in_features=ctx.in_features, out_features=ctx.out_features,
-            stride_x_batch=x.stride(0), stride_x_in=x.stride(1),
-            stride_grad_out_batch=grad_output.stride(0), stride_grad_out_d=grad_output.stride(1),
-            stride_grad_x_batch=grad_x.stride(0), stride_grad_x_in=grad_x.stride(1),
-            stride_meta_adapter=metadata.stride(0), stride_meta_field=metadata.stride(1),
-            BLOCK_SIZE_K=block_size, BLOCK_SIZE_N=block_size, MAX_RANK_BLOCK=ctx.max_rank_block,
+        # Launch fused backward (one program per token)
+        grid = (T,)
+
+        _batched_lora_backward[grid](
+            x_tok, grad_out_tok,
+            lora_a_flat, lora_b_flat,
+            metadata, adapter_indices,
+            grad_x_tok, grad_lora_a_flat, grad_lora_b_flat,
+            in_features, out_features,
+            x_tok.stride(0), x_tok.stride(1),
+            grad_out_tok.stride(0), grad_out_tok.stride(1),
+            grad_x_tok.stride(0), grad_x_tok.stride(1),
+            metadata.stride(0), metadata.stride(1),
+            BLOCK_SIZE_K=64, BLOCK_SIZE_N=64, R_TILE=32,
         )
-        
+
+        # Un-flatten grad_x to original layout if needed
+        if is_bsd:
+            grad_x = grad_x_tok.view(B, S, in_features)
+        else:
+            grad_x = grad_x_tok
+
+        # Return gradients for inputs: (x, lora_a_flat, lora_b_flat, metadata, adapter_indices, block_size)
+        # Only the first three are tensors we compute gradients for; others are None
         return grad_x, grad_lora_a_flat, grad_lora_b_flat, None, None, None
 
 batched_lora_heterogeneous = BatchedLoRAFunctionHeterogeneous.apply
