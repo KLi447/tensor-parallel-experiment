@@ -4,17 +4,38 @@ import triton.testing
 from lora_kernel import batched_lora_heterogeneous, prepare_heterogeneous_lora_weights
 
 def reference_lora_forward(x, lora_a_list, lora_b_list, adapter_indices):
-    out_slices = []
-    for i in range(x.size(0)):
-        adapter_idx = int(adapter_indices[i].item())
-        x_i = x[i].unsqueeze(0)
-        a_i = lora_a_list[adapter_idx]
-        b_i = lora_b_list[adapter_idx]
-        intermediate = x_i.matmul(a_i.t())
-        final_output = intermediate.matmul(b_i.t())
-        out_slices.append(final_output)
-    return torch.cat(out_slices, dim=0)
+    out_features = lora_b_list[0].shape[0]
+    output = torch.empty(x.size(0), out_features, device=x.device, dtype=x.dtype)
 
+    sorted_indices, sorted_positions = torch.sort(adapter_indices)
+
+    unsorter = torch.empty_like(sorted_positions)
+    unsorter[sorted_positions] = torch.arange(len(sorted_positions), device=x.device)
+
+    x_sorted = x[sorted_positions]
+
+    unique_adapters, group_sizes = torch.unique_consecutive(sorted_indices, return_counts=True)
+
+    group_boundaries = torch.cumsum(group_sizes, dim=0)
+
+    start_idx = 0
+    for i, adapter_id in enumerate(unique_adapters):
+        group_size = group_sizes[i].item()
+        end_idx = start_idx + group_size
+
+        x_group = x_sorted[start_idx:end_idx]
+
+        a_matrix = lora_a_list[adapter_id]
+        b_matrix = lora_b_list[adapter_id]
+
+        intermediate = x_group @ a_matrix.T
+        final_output = intermediate @ b_matrix.T
+
+        output[start_idx:end_idx] = final_output
+
+        start_idx = end_idx
+
+    return output[unsorter]
 
 if __name__ == '__main__':
     BATCH_SIZE = 32
@@ -44,7 +65,7 @@ if __name__ == '__main__':
 
     print("Verifying Triton kernel against reference implementation...")
 
-    output_triton = batched_lora_heterogeneous(x, lora_a_flat, lora_b_flat, metadata, adapter_indices)
+    output_triton = batched_lora_heterogeneous(x, lora_a_flat, lora_b_flat, metadata, adapter_indices, OUT_FEATURES)
     torch.cuda.synchronize()
     (output_triton.sum()).backward()
     torch.cuda.synchronize()
@@ -83,7 +104,7 @@ if __name__ == '__main__':
         quantiles=quantiles
     )
     triton_fwd_latency = triton.testing.do_bench(
-        lambda: batched_lora_heterogeneous(x_fwd, lora_a_flat_fwd, lora_b_flat_fwd, metadata, adapter_indices),
+        lambda: batched_lora_heterogeneous(x_fwd, lora_a_flat_fwd, lora_b_flat_fwd, metadata, adapter_indices, OUT_FEATURES),
         quantiles=quantiles
     )
 
@@ -98,7 +119,7 @@ if __name__ == '__main__':
         x_b = x.detach().requires_grad_()
         a_b = lora_a_flat.detach().requires_grad_()
         b_b = lora_b_flat.detach().requires_grad_()
-        out = batched_lora_heterogeneous(x_b, a_b, b_b, metadata, adapter_indices)
+        out = batched_lora_heterogeneous(x_b, a_b, b_b, metadata, adapter_indices, OUT_FEATURES)
         out.sum().backward(retain_graph=False)
         torch.cuda.synchronize()
 
@@ -110,8 +131,8 @@ if __name__ == '__main__':
         out_ref.sum().backward(retain_graph=False)
         torch.cuda.synchronize()
 
-    ref_bwd_latency = triton.testing.do_bench(ref_backward_once, warmup=100, rep=1000, quantiles=quantiles)
-    triton_bwd_latency = triton.testing.do_bench(triton_backward_once, warmup=100, rep=1000, quantiles=quantiles)
+    ref_bwd_latency = triton.testing.do_bench(ref_backward_once, quantiles=quantiles)
+    triton_bwd_latency = triton.testing.do_bench(triton_backward_once, quantiles=quantiles)
 
     median_ref_bwd = ref_bwd_latency[1]
     median_triton_bwd = triton_bwd_latency[1]
@@ -121,4 +142,8 @@ if __name__ == '__main__':
     print(f"Triton Backward   (Median Latency): {median_triton_bwd:.6f} s")
     print(f"Backward Speedup: {speedup_bwd:.2f}x")
 
+    print(f"Reference Total (Median Latency): {(median_ref_fwd + median_ref_bwd):.6f} s")
+    print(f"Triton Total (Median Latency): {(median_triton_fwd + median_triton_bwd):.6f} s")
+    total_speedup = (median_ref_fwd + median_ref_bwd) / max(1e-12, (median_triton_fwd + median_triton_bwd))
+    print(f"Total Speedup: {total_speedup:.2f}x")
     print("\nDone.")

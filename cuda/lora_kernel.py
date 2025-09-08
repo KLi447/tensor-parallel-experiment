@@ -206,7 +206,7 @@ def _batched_lora_backwardB(
 
 class BatchedLoRAFunctionHeterogeneous(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, lora_a_flat, lora_b_flat, metadata, adapter_indices):
+    def forward(ctx, x, lora_a_flat, lora_b_flat, metadata, adapter_indices, out_features):
         x = x.contiguous()
         is_bsd = (x.ndim == 3)
         if is_bsd:
@@ -218,7 +218,6 @@ class BatchedLoRAFunctionHeterogeneous(torch.autograd.Function):
             T, D = x_tok.shape
 
         in_features = D
-        out_features = in_features
 
         output_tok = torch.empty((T, out_features), device=x.device, dtype=x.dtype)
         
