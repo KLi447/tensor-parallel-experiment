@@ -126,15 +126,15 @@ def benchmark_model_pass(model, input_ids, adapter_indices, lora_params):
 
 
 if __name__ == '__main__':
-    # MODEL_ID = "meta-llama/Meta-Llama-3-8B"
-    MODEL_ID = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+    MODEL_ID = "meta-llama/Meta-Llama-3-8B"
+    # MODEL_ID = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
     DEVICE = 'cuda'
     DTYPE = torch.float32
     BATCH_SIZE = 4
     SEQ_LEN = 512
     
-    # rank_list = [2, 16, 32, 64, 128]
-    rank_list = [4, 4, 32, 32, 64]
+    rank_list = [2, 16, 32, 64, 128]
+    # rank_list = [4, 4, 32, 32, 64]
     NUM_ADAPTERS = len(rank_list)
     TARGET_MODULES = ["q_proj", "v_proj"] 
 
@@ -154,7 +154,7 @@ if __name__ == '__main__':
     model_ref.eval().zero_grad()
     ref_latency = triton.testing.do_bench(
         lambda: benchmark_model_pass(model_ref, input_ids, adapter_indices, lora_params_ref),
-        warmup=10, rep=50 ,quantiles=quantiles
+        warmup=10, rep=100 ,quantiles=quantiles
     )
     median_ref = ref_latency[1]
     print(f"Reference Median Latency: {median_ref:.6f} s")
@@ -174,10 +174,13 @@ if __name__ == '__main__':
     lora_params_triton = prepare_all_lora_weights(model_triton, rank_list, DEVICE)
 
     model_triton.eval().zero_grad()
-    triton_latency = triton.testing.do_bench(
-        lambda: benchmark_model_pass(model_triton, input_ids, adapter_indices, lora_params_triton),
-        warmup=10, rep=50, quantiles=quantiles
-    )
+    with torch.autograd.profiler.profile(use_device='cuda') as prof:
+        triton_latency = triton.testing.do_bench(
+            lambda: benchmark_model_pass(model_triton, input_ids, adapter_indices, lora_params_triton),
+            warmup=10, rep=100, quantiles=quantiles
+        )
+
+    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=50))
     median_triton = triton_latency[1]
     print(f"Triton Median Latency: {median_triton:.6f} s")
 
